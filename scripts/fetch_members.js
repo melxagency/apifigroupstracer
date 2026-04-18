@@ -93,6 +93,12 @@ const GRUPOS = [
   { name: "Cubanos en Montreal Canadá-1", url: "https://www.facebook.com/groups/1985567971886403/" },
 ];
 
+// ── Construir URL /members a partir de la URL base del grupo ──
+function getMembersUrl(groupUrl) {
+  const base = groupUrl.endsWith("/") ? groupUrl : groupUrl + "/";
+  return base + "members/";
+}
+
 // ── Cookie helper ──────────────────────────────────────────────
 function buildCookieHeader(cookiesJson) {
   try {
@@ -103,12 +109,14 @@ function buildCookieHeader(cookiesJson) {
   }
 }
 
-// ── Fetch HTML de un grupo ─────────────────────────────────────
-function fetchGroupPage(url, cookieHeader) {
+// ── Fetch HTML de una URL ──────────────────────────────────────
+function fetchPage(url, cookieHeader) {
   return new Promise((resolve) => {
+    const parsedPath = "/" + url.replace("https://www.facebook.com/", "");
+
     const options = {
       hostname: "www.facebook.com",
-      path: "/" + url.replace("https://www.facebook.com/", ""),
+      path: parsedPath,
       method: "GET",
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -123,8 +131,7 @@ function fetchGroupPage(url, cookieHeader) {
     };
 
     const req = https.request(options, (res) => {
-      // Seguir redirecciones simples (no hacia login)
-      if ((res.statusCode === 301 || res.statusCode === 302)) {
+      if (res.statusCode === 301 || res.statusCode === 302) {
         const redirectUrl = res.headers.location || "";
         if (redirectUrl.includes("login") || redirectUrl.includes("checkpoint")) {
           resolve({ html: "", error: "redirect_login" });
@@ -143,97 +150,78 @@ function fetchGroupPage(url, cookieHeader) {
   });
 }
 
-// ── Extraer memberCount del HTML de Facebook ──────────────────
-// ESTRATEGIA: Facebook embebe "member_count":NÚMERO muchas veces en el HTML,
-// pero la mayoría son valores internos pequeños (IDs de config, etc.).
-// El conteo REAL de miembros es siempre el valor MÁS ALTO entre todos los
-// matches de "member_count", ya que un grupo tiene miles/millones de miembros
-// y los valores falsos son típicamente < 100.
+// ── Extraer memberCount desde la página /members ──────────────
+// La página /members muestra el número exacto sin abreviar:
+//   "Miembros · 66 975"  (español, espacio como separador de miles)
+//   "Members · 66,975"   (inglés, coma como separador)
+// Eso es lo que buscamos primero. Como fallback usamos el JSON embebido
+// tomando el valor MÁXIMO (el real siempre es el más alto).
 function extractMemberCount(html) {
   if (!html || html.length < 100) return null;
 
   const candidates = [];
 
-  // ── Estrategia 1: Todos los "member_count":N del JSON embebido ──
-  // Tomamos TODOS los valores y nos quedamos con el máximo
-  const memberCountMatches = [...html.matchAll(/"member_count"\s*:\s*(\d+)/g)];
-  for (const m of memberCountMatches) {
-    const n = parseInt(m[1], 10);
-    if (n >= 10 && n <= 50_000_000) candidates.push(n);
-  }
-
-  const memberCountTextMatches = [...html.matchAll(/"members_count"\s*:\s*(\d+)/g)];
-  for (const m of memberCountTextMatches) {
-    const n = parseInt(m[1], 10);
-    if (n >= 10 && n <= 50_000_000) candidates.push(n);
-  }
-
-  // ── Estrategia 2: Texto visible en la página ──
-  // "67.400 miembros", "1,234 members", "67,4 mil miembros", "12.5K members"
-  const textPatterns = [
-    // Español — "X mil miembros" (ej: "67,4 mil miembros" → 67400)
-    { re: /([\d]+[.,][\d]+)\s*mil\s*miembros/gi, factor: 1000, decimal: true },
-    { re: /(\d+)\s*mil\s*miembros/gi, factor: 1000, decimal: false },
-    // Inglés — "X.XK members" (ej: "12.5K members" → 12500)
-    { re: /([\d]+[.,][\d]+)\s*[Kk]\s*members?/g, factor: 1000, decimal: true },
-    { re: /(\d+)\s*[Kk]\s*members?/g, factor: 1000, decimal: false },
-    // Número completo con separadores de miles (punto o coma como separador)
-    // Español: "67.400 miembros"
-    { re: /(\d{1,3}(?:\.\d{3})+)\s*miembros/gi, factor: 1, decimal: false, dotThousands: true },
-    // Inglés: "67,400 members"
-    { re: /(\d{1,3}(?:,\d{3})+)\s*members?/gi, factor: 1, decimal: false, commaThousands: true },
-    // Sin separador: "67400 miembros" / "67400 members"
-    { re: /(\d{4,})\s*miembros/gi, factor: 1, decimal: false },
-    { re: /(\d{4,})\s*members?/gi, factor: 1, decimal: false },
+  // ── Estrategia 1: Cabecera exacta "Miembros · N" de la sección /members ──
+  // Es el dato más preciso y sin ambigüedad.
+  const headerPatterns = [
+    /[Mm]iembros\s*[·•]\s*([\d][\d\s.,]*)/,
+    /[Mm]embers\s*[·•]\s*([\d][\d\s.,]*)/,
   ];
-
-  for (const { re, factor, decimal, dotThousands, commaThousands } of textPatterns) {
-    for (const m of [...html.matchAll(re)]) {
-      let raw = m[1];
-      let val;
-
-      if (dotThousands) {
-        // "67.400" → quitar puntos → 67400
-        val = parseInt(raw.replace(/\./g, ""), 10);
-      } else if (commaThousands) {
-        // "67,400" → quitar comas → 67400
-        val = parseInt(raw.replace(/,/g, ""), 10);
-      } else if (decimal) {
-        // "67,4" o "67.4" → float → * factor
-        val = Math.round(parseFloat(raw.replace(",", ".")) * factor);
-      } else {
-        val = parseInt(raw, 10) * factor;
+  for (const re of headerPatterns) {
+    const m = html.match(re);
+    if (m) {
+      // Quitar separadores: espacios, puntos, comas
+      const val = parseInt(m[1].replace(/[\s.,]/g, ""), 10);
+      if (!isNaN(val) && val >= 1 && val <= 50_000_000) {
+        candidates.push(val);
       }
-
-      if (!isNaN(val) && val >= 10 && val <= 50_000_000) candidates.push(val);
     }
   }
 
-  // ── Estrategia 3: "member_count_text" con texto como "67,4 mil" ──
-  const memberCountTextStr = [...html.matchAll(/"member_count_text"\s*:\s*"([^"]+)"/g)];
-  for (const m of memberCountTextStr) {
-    const text = m[1];
-    // "67,4 mil" o "67.4K" o "1,234"
-    const milMatch = text.match(/([\d]+[.,][\d]+)\s*mil/i);
-    const kMatch = text.match(/([\d]+[.,][\d]+)\s*[Kk]/i);
-    const plainMatch = text.match(/^([\d.,]+)$/);
+  // ── Estrategia 2: JSON embebido — MÁXIMO de todos los member_count ──
+  for (const m of [...html.matchAll(/"member_count"\s*:\s*(\d+)/g)]) {
+    const n = parseInt(m[1], 10);
+    if (n >= 10 && n <= 50_000_000) candidates.push(n);
+  }
+  for (const m of [...html.matchAll(/"members_count"\s*:\s*(\d+)/g)]) {
+    const n = parseInt(m[1], 10);
+    if (n >= 10 && n <= 50_000_000) candidates.push(n);
+  }
 
+  // ── Estrategia 3: member_count_text con texto abreviado ──
+  for (const m of [...html.matchAll(/"member_count_text"\s*:\s*"([^"]+)"/g)]) {
+    const text = m[1];
+    const milMatch = text.match(/([\d]+[.,][\d]+)\s*mil/i);
+    const kMatch   = text.match(/([\d]+[.,][\d]+)\s*[Kk]/i);
+    const plain    = text.match(/^([\d\s.,]+)$/);
     if (milMatch) {
-      const val = Math.round(parseFloat(milMatch[1].replace(",", ".")) * 1000);
-      if (val >= 10 && val <= 50_000_000) candidates.push(val);
+      candidates.push(Math.round(parseFloat(milMatch[1].replace(",", ".")) * 1000));
     } else if (kMatch) {
-      const val = Math.round(parseFloat(kMatch[1].replace(",", ".")) * 1000);
-      if (val >= 10 && val <= 50_000_000) candidates.push(val);
-    } else if (plainMatch) {
-      const val = parseInt(plainMatch[1].replace(/[.,]/g, ""), 10);
-      if (val >= 10 && val <= 50_000_000) candidates.push(val);
+      candidates.push(Math.round(parseFloat(kMatch[1].replace(",", ".")) * 1000));
+    } else if (plain) {
+      const val = parseInt(plain[1].replace(/[\s.,]/g, ""), 10);
+      if (!isNaN(val) && val >= 10) candidates.push(val);
+    }
+  }
+
+  // ── Estrategia 4: Texto visible con número exacto ──
+  const textPatterns = [
+    /(\d[\d\s]{2,})\s*miembros/gi,               // "66 975 miembros" (espacio)
+    /(\d{1,3}(?:\.\d{3})+)\s*miembros/gi,         // "66.975 miembros" (punto)
+    /(\d{1,3}(?:,\d{3})+)\s*members?/gi,          // "66,975 members" (coma)
+    /(\d{4,})\s*miembros/gi,                      // "66975 miembros" (sin sep.)
+    /(\d{4,})\s*members?/gi,                      // "66975 members"
+  ];
+  for (const re of textPatterns) {
+    for (const m of [...html.matchAll(re)]) {
+      const val = parseInt(m[1].replace(/[\s.,]/g, ""), 10);
+      if (!isNaN(val) && val >= 10 && val <= 50_000_000) candidates.push(val);
     }
   }
 
   if (candidates.length === 0) return null;
 
-  // El conteo real de miembros es el valor MÁS ALTO entre todos los candidatos.
-  // Los valores falsos (config interna de Facebook) son siempre pequeños.
+  // El conteo real siempre es el valor más alto entre todos los candidatos
   return Math.max(...candidates);
 }
 
@@ -254,7 +242,7 @@ async function main() {
 
   console.log(`🍪 Cookies cargadas correctamente`);
   console.log(`📋 Grupos a procesar: ${GRUPOS.length}`);
-  console.log(`\n⏳ Procesando grupos...\n`);
+  console.log(`\n⏳ Procesando grupos (leyendo /members de cada grupo)...\n`);
 
   const today = new Date().toISOString().split("T")[0];
   const results = [];
@@ -264,7 +252,9 @@ async function main() {
     const grupo = GRUPOS[i];
     process.stdout.write(`[${String(i + 1).padStart(2, "0")}/${GRUPOS.length}] ${grupo.name}... `);
 
-    const { html, error, status } = await fetchGroupPage(grupo.url, cookieHeader);
+    // ← CAMBIO CLAVE: fetch a /members/ en lugar de la URL base
+    const membersUrl = getMembersUrl(grupo.url);
+    const { html, error, status } = await fetchPage(membersUrl, cookieHeader);
 
     if (error === "redirect_login") {
       console.log("⚠️  redirigido a login (cookies expiradas)");
@@ -283,31 +273,27 @@ async function main() {
       } else {
         console.log(`⚠️  N/A (HTTP ${status})`);
 
-        // Guardar HTML del primer grupo sin datos para diagnóstico
+        // Diagnóstico del primer fallo
         if (!debugSaved) {
           debugSaved = true;
-          fs.writeFileSync("/tmp/debug_html.txt", html.slice(0, 5000));
-          // Mostrar todos los "member_count" encontrados para diagnóstico
+          fs.writeFileSync("/tmp/debug_members.html", html.slice(0, 8000));
           const allMC = [...html.matchAll(/"member_count"\s*:\s*(\d+)/g)].map(m => m[1]);
-          if (allMC.length) {
-            console.log(`   🔍 "member_count" values en HTML: ${allMC.join(", ")}`);
-          } else {
-            console.log(`   🔍 No se encontró "member_count" en el HTML`);
-          }
+          console.log(`   🔍 "member_count" en HTML: ${allMC.length ? allMC.join(", ") : "ninguno"}`);
+          const headerMatch = html.match(/[Mm]iembros\s*[·•]\s*([\d][\d\s.,]*)/);
+          console.log(`   🔍 Cabecera "Miembros ·": ${headerMatch ? headerMatch[0] : "no encontrada"}`);
         }
 
         results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros: null, estado: "sin_datos" });
       }
     }
 
-    // Pausa entre requests para evitar bloqueo
     if (i < GRUPOS.length - 1) await sleep(1500);
   }
 
   // ── Resumen ────────────────────────────────────────────────
   const totalMiembros = results.reduce((s, r) => s + (r.miembros || 0), 0);
-  const conDatos = results.filter((r) => r.estado === "ok").length;
-  const sinDatos = results.filter((r) => r.estado !== "ok").length;
+  const conDatos      = results.filter((r) => r.estado === "ok").length;
+  const sinDatos      = results.filter((r) => r.estado !== "ok").length;
 
   console.log("\n════════════════════════════════════════════");
   console.log(`📅 Fecha         : ${today}`);
@@ -320,7 +306,6 @@ async function main() {
   const dataDir = path.join(process.cwd(), "data");
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
-  // history.json — acumula todas las ejecuciones
   const historyFile = path.join(dataDir, "history.json");
   let history = [];
   if (fs.existsSync(historyFile)) {
@@ -329,12 +314,11 @@ async function main() {
   history.push({ fecha: today, total: totalMiembros, conDatos, grupos: results });
   fs.writeFileSync(historyFile, JSON.stringify(history, null, 2));
 
-  // CSV diario
-  const csv = "fecha,nombre,url,miembros,estado\n" +
+  const csv =
+    "fecha,nombre,url,miembros,estado\n" +
     results.map((r) => `${r.fecha},"${r.nombre}","${r.url}",${r.miembros ?? ""},${r.estado}`).join("\n");
   fs.writeFileSync(path.join(dataDir, `miembros_${today}.csv`), csv);
 
-  // latest.json — snapshot del último run
   fs.writeFileSync(
     path.join(dataDir, "latest.json"),
     JSON.stringify({ fecha: today, total: totalMiembros, conDatos, sinDatos, grupos: results }, null, 2)
