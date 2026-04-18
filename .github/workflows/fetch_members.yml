@@ -1,0 +1,62 @@
+name: 📊 Actualizar Miembros de Grupos Facebook
+
+on:
+  # Ejecutar cada día a las 8:00 AM (hora Cuba / EST)
+  schedule:
+    - cron: "0 13 * * *"   # 13:00 UTC = 8:00 AM EST / 9:00 AM Cuba
+
+  # También permite ejecutarlo manualmente desde GitHub
+  workflow_dispatch:
+    inputs:
+      motivo:
+        description: "Motivo de la ejecución manual"
+        required: false
+        default: "Actualización manual"
+
+jobs:
+  fetch-members:
+    name: Obtener miembros de grupos
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write   # Para hacer commit de los datos
+
+    steps:
+      # ── 1. Clonar el repositorio ──────────────────────────────
+      - name: 📂 Checkout repositorio
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Instalar Node.js ───────────────────────────────────
+      - name: 🟢 Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ── 3. Ejecutar el script ─────────────────────────────────
+      - name: 🚀 Ejecutar scraper de miembros
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          FB_COOKIES: ${{ secrets.FB_COOKIES }}
+        run: node scripts/fetch_members.js
+
+      # ── 4. Guardar los resultados en el repo ──────────────────
+      - name: 💾 Commit y push de resultados
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/
+          git diff --staged --quiet || git commit -m "📊 Actualización miembros $(date +'%Y-%m-%d')"
+          git push
+
+      # ── 5. Notificación si falla ──────────────────────────────
+      - name: ❌ Notificar fallo
+        if: failure()
+        run: |
+          echo "::error::El scraper falló. Revisa los logs para más detalles."
+          echo "Posibles causas:"
+          echo "  1. APIFY_TOKEN expirado o incorrecto"
+          echo "  2. FB_COOKIES expiradas (renovar cada 30 días)"
+          echo "  3. Actor de Apify cambió su API"
