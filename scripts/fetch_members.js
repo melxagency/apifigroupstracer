@@ -147,36 +147,31 @@ function fetchGroupPage(url, cookieHeader) {
 function extractMemberCount(html) {
   if (!html || html.length < 1000) return null;
 
-  // 🔒 1. JSON fiable (mejor fuente)
-  const jsonMatch = html.match(/"member_count"\s*:\s*(\d{2,})/);
+  // 🥇 1. JSON real (más fiable)
+  const jsonMatch = html.match(/"member_count"\s*:\s*(\d{3,})/);
   if (jsonMatch) {
-    const val = parseInt(jsonMatch[1], 10);
-    if (val > 50) return val;
+    return parseInt(jsonMatch[1], 10);
   }
 
-  // 🔒 2. numberOfMembers (schema)
-  const schemaMatch = html.match(/"numberOfMembers"\s*:\s*(\d{2,})/);
-  if (schemaMatch) {
-    const val = parseInt(schemaMatch[1], 10);
-    if (val > 50) return val;
+  // 🥈 2. Texto exacto con "miembros"
+  const textMatch = html.match(/(\d{1,3}(?:[.,]\d{3})+)\s+miembros/i);
+  if (textMatch) {
+    return parseInt(textMatch[1].replace(/[.,]/g, ""), 10);
   }
 
-  // 🔒 3. Texto completo (ej: 12,345 miembros)
-  const fullText = html.match(/(\d{1,3}(?:[.,]\d{3})+)\s*(miembros|members)/i);
-  if (fullText) {
-    const val = parseInt(fullText[1].replace(/[.,]/g, ""), 10);
-    if (val > 50) return val;
+  // 🥉 3. Texto exacto con "members"
+  const textMatchEn = html.match(/(\d{1,3}(?:[.,]\d{3})+)\s+members/i);
+  if (textMatchEn) {
+    return parseInt(textMatchEn[1].replace(/[.,]/g, ""), 10);
   }
 
-  // 🔒 4. Formato abreviado (ej: 12.3K o 12,3 mil)
-  const shortText = html.match(/([\d,.]+)\s*(K|mil)\s*(miembros|members)?/i);
-  if (shortText) {
-    const num = parseFloat(shortText[1].replace(",", "."));
-    const val = Math.round(num * 1000);
-    if (val > 50) return val;
+  // 🟡 4. Formato abreviado PERO con palabra clave obligatoria
+  const shortMatch = html.match(/([\d,.]+)\s*(mil|K)\s+(miembros|members)/i);
+  if (shortMatch) {
+    const num = parseFloat(shortMatch[1].replace(",", "."));
+    return Math.round(num * 1000);
   }
 
-  // ❌ Si no encontramos nada fiable → null
   return null;
 }
 
