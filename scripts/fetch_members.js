@@ -145,45 +145,41 @@ function fetchGroupPage(url, cookieHeader) {
 
 // ── Extraer memberCount del HTML de Facebook ──────────────────
 function extractMemberCount(html) {
-  if (!html || html.length < 100) return null;
+  if (!html || html.length < 1000) return null;
 
-  const patterns = [
-    // JSON embebido en el HTML — formato más común
-    /"member_count"\s*:\s*(\d+)/,
-    /"memberCount"\s*:\s*(\d+)/,
-    /"members_count"\s*:\s*(\d+)/,
-    /"member_count_text"\s*:\s*"([^"]+)"/,
-    // Texto visible en la página
-    /(\d[\d,.]+)\s*miembros/i,
-    /(\d[\d,.]+)\s*members/i,
-    /(\d[\d,.]+)\s*member/i,
-    // Formato abreviado: "67,4 mil miembros" o "1.2K members"
-    /([\d,.]+)\s*[Kk]\s*members?/i,
-    /([\d,.]+)\s*mil\s*miembros/i,
-    // En meta tags o JSON-LD
-    /"numberOfMembers"\s*:\s*(\d+)/,
-    /"count"\s*:\s*(\d+)/,
-  ];
-
-  for (const pattern of patterns) {
-    const match = html.match(pattern);
-    if (match) {
-      let val = match[1].replace(/,/g, "").replace(/\./g, "");
-
-      // Convertir abreviaturas: "67.4K" o "67,4 mil"
-      if (match[0].toLowerCase().includes("mil")) {
-        val = Math.round(parseFloat(match[1].replace(",", ".")) * 1000);
-      } else if (match[0].toLowerCase().includes("k")) {
-        val = Math.round(parseFloat(match[1].replace(",", ".")) * 1000);
-      } else {
-        val = parseInt(val, 10);
-      }
-
-      if (!isNaN(val) && val > 0) return val;
-    }
+  // 🔒 1. JSON fiable (mejor fuente)
+  const jsonMatch = html.match(/"member_count"\s*:\s*(\d{2,})/);
+  if (jsonMatch) {
+    const val = parseInt(jsonMatch[1], 10);
+    if (val > 50) return val;
   }
+
+  // 🔒 2. numberOfMembers (schema)
+  const schemaMatch = html.match(/"numberOfMembers"\s*:\s*(\d{2,})/);
+  if (schemaMatch) {
+    const val = parseInt(schemaMatch[1], 10);
+    if (val > 50) return val;
+  }
+
+  // 🔒 3. Texto completo (ej: 12,345 miembros)
+  const fullText = html.match(/(\d{1,3}(?:[.,]\d{3})+)\s*(miembros|members)/i);
+  if (fullText) {
+    const val = parseInt(fullText[1].replace(/[.,]/g, ""), 10);
+    if (val > 50) return val;
+  }
+
+  // 🔒 4. Formato abreviado (ej: 12.3K o 12,3 mil)
+  const shortText = html.match(/([\d,.]+)\s*(K|mil)\s*(miembros|members)?/i);
+  if (shortText) {
+    const num = parseFloat(shortText[1].replace(",", "."));
+    const val = Math.round(num * 1000);
+    if (val > 50) return val;
+  }
+
+  // ❌ Si no encontramos nada fiable → null
   return null;
 }
+
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
