@@ -145,36 +145,45 @@ function fetchGroupPage(url, cookieHeader) {
 
 // ── Extraer memberCount del HTML de Facebook ──────────────────
 function extractMemberCount(html) {
-  if (!html || html.length < 1000) return null;
+  if (!html || html.length < 100) return null;
 
-  // 🥇 1. JSON real (más fiable)
-  const jsonMatch = html.match(/"member_count"\s*:\s*(\d{3,})/);
-  if (jsonMatch) {
-    return parseInt(jsonMatch[1], 10);
+  const patterns = [
+    // JSON embebido en el HTML — formato más común
+    /"member_count"\s*:\s*(\d+)/,
+    /"memberCount"\s*:\s*(\d+)/,
+    /"members_count"\s*:\s*(\d+)/,
+    /"member_count_text"\s*:\s*"([^"]+)"/,
+    // Texto visible en la página
+    /(\d[\d,.]+)\s*miembros/i,
+    /(\d[\d,.]+)\s*members/i,
+    /(\d[\d,.]+)\s*member/i,
+    // Formato abreviado: "67,4 mil miembros" o "1.2K members"
+    /([\d,.]+)\s*[Kk]\s*members?/i,
+    /([\d,.]+)\s*mil\s*miembros/i,
+    // En meta tags o JSON-LD
+    /"numberOfMembers"\s*:\s*(\d+)/,
+    /"count"\s*:\s*(\d+)/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match) {
+      let val = match[1].replace(/,/g, "").replace(/\./g, "");
+
+      // Convertir abreviaturas: "67.4K" o "67,4 mil"
+      if (match[0].toLowerCase().includes("mil")) {
+        val = Math.round(parseFloat(match[1].replace(",", ".")) * 1000);
+      } else if (match[0].toLowerCase().includes("k")) {
+        val = Math.round(parseFloat(match[1].replace(",", ".")) * 1000);
+      } else {
+        val = parseInt(val, 10);
+      }
+
+      if (!isNaN(val) && val > 0) return val;
+    }
   }
-
-  // 🥈 2. Texto exacto con "miembros"
-  const textMatch = html.match(/(\d{1,3}(?:[.,]\d{3})+)\s+miembros/i);
-  if (textMatch) {
-    return parseInt(textMatch[1].replace(/[.,]/g, ""), 10);
-  }
-
-  // 🥉 3. Texto exacto con "members"
-  const textMatchEn = html.match(/(\d{1,3}(?:[.,]\d{3})+)\s+members/i);
-  if (textMatchEn) {
-    return parseInt(textMatchEn[1].replace(/[.,]/g, ""), 10);
-  }
-
-  // 🟡 4. Formato abreviado PERO con palabra clave obligatoria
-  const shortMatch = html.match(/([\d,.]+)\s*(mil|K)\s+(miembros|members)/i);
-  if (shortMatch) {
-    const num = parseFloat(shortMatch[1].replace(",", "."));
-    return Math.round(num * 1000);
-  }
-
   return null;
 }
-
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
