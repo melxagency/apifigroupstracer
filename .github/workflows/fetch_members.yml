@@ -1,26 +1,30 @@
 name: 📊 Actualizar Miembros de Grupos Facebook
 
 on:
-  # Ejecutar cada día a las 8:00 AM (hora Cuba / EST)
   schedule:
     - cron: "0 13 * * *"   # 13:00 UTC = 8:00 AM EST / 9:00 AM Cuba
-
-  # También permite ejecutarlo manualmente desde GitHub
   workflow_dispatch:
     inputs:
       motivo:
         description: "Motivo de la ejecución manual"
         required: false
         default: "Actualización manual"
+      debug:
+        description: "Activar modo debug (guarda HTML crudo)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   fetch-members:
     name: Obtener miembros de grupos
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 45
     permissions:
-      contents: write   # Para hacer commit de los datos
+      contents: write
 
     steps:
       # ── 1. Clonar el repositorio ──────────────────────────────
@@ -35,28 +39,137 @@ jobs:
         with:
           node-version: "20"
 
-      # ── 3. Ejecutar el script ─────────────────────────────────
-      - name: 🚀 Ejecutar scraper de miembros
+      # ── 3. Verificar que los secrets existen ──────────────────
+      - name: 🔑 Verificar secrets
+        run: |
+          if [ -z "${{ secrets.FB_COOKIES }}" ]; then
+            echo "::error::FB_COOKIES no está configurado en los secrets del repositorio"
+            exit 1
+          fi
+          echo "✅ FB_COOKIES presente (longitud: ${#FB_COOKIES} chars)"
+          # Verificar que el directorio scripts existe
+          if [ ! -f "scripts/fetch_members.js" ]; then
+            echo "::error::No se encuentra scripts/fetch_members.js"
+            ls -la scripts/ || echo "El directorio scripts/ no existe"
+            exit 1
+          fi
+          echo "✅ Script encontrado"
         env:
-          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           FB_COOKIES: ${{ secrets.FB_COOKIES }}
-        run: node scripts/fetch_members.js
 
-      # ── 4. Guardar los resultados en el repo ──────────────────
+      # ── 4. Modo debug (solo cuando se activa manualmente) ─────
+      - name: 🔍 Debug HTML (diagnóstico)
+        if: ${{ github.event.inputs.debug == 'true' }}
+        env:
+          FB_COOKIES: ${{ secrets.FB_COOKIES }}
+        run: |
+          node scripts/debug_html.js 2>&1 | tee debug_output.txt || true
+          echo "Debug completado"
+
+      # ── 5. Subir HTML de debug como artifact ──────────────────
+      - name: 📁 Subir artifacts de debug
+        if: ${{ github.event.inputs.debug == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html-${{ github.run_id }}
+          path: |
+            debug_*.html
+            debug_output.txt
+          retention-days: 3
+          if-no-files-found: ignore
+
+      # ── 6. Ejecutar el scraper principal ─────────────────────
+      - name: 🚀 Ejecutar scraper de miembros
+        id: scraper
+        env:
+          FB_COOKIES: ${{ secrets.FB_COOKIES }}
+        run: |
+          node scripts/fetch_members.js 2>&1 | tee scraper_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          # Extraer métricas del output para el summary
+          TOTAL=$(grep "TOTAL MIEMBROS" scraper_output.txt | grep -oP '[\d,\.]+' | tail -1 || echo "0")
+          CON_DATOS=$(grep "Con datos" scraper_output.txt | grep -oP '\d+(?=/)' || echo "0")
+          SIN_DATOS=$(grep "Sin datos" scraper_output.txt | grep -oP '\d+(?=/)' || echo "0")
+
+          echo "total_miembros=$TOTAL"   >> $GITHUB_OUTPUT
+          echo "con_datos=$CON_DATOS"    >> $GITHUB_OUTPUT
+          echo "sin_datos=$SIN_DATOS"    >> $GITHUB_OUTPUT
+
+          # Fallar solo si el script salió con error Y no hay datos en absoluto
+          if [ $EXIT_CODE -ne 0 ] && [ "$CON_DATOS" = "0" ]; then
+            echo "::error::El scraper falló completamente sin obtener ningún dato"
+            exit 1
+          fi
+
+          # Advertencia si hay muchos fallos pero no error total
+          if [ "$SIN_DATOS" -gt "50" ] 2>/dev/null; then
+            echo "::warning::Más de 50 grupos sin datos. Las cookies pueden estar próximas a expirar."
+          fi
+
+      # ── 7. Subir log del scraper como artifact ────────────────
+      - name: 📋 Subir log de ejecución
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-log-${{ github.run_id }}
+          path: scraper_output.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ── 8. Guardar resultados en el repo ─────────────────────
       - name: 💾 Commit y push de resultados
+        if: steps.scraper.outputs.con_datos != '0'
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add data/
-          git diff --staged --quiet || git commit -m "📊 Actualización miembros $(date +'%Y-%m-%d')"
-          git push
 
-      # ── 5. Notificación si falla ──────────────────────────────
-      - name: ❌ Notificar fallo
+          # Solo hacer commit si hay cambios reales
+          if git diff --staged --quiet; then
+            echo "ℹ️  Sin cambios en los datos, no se hace commit"
+          else
+            FECHA=$(date +'%Y-%m-%d')
+            TOTAL="${{ steps.scraper.outputs.total_miembros }}"
+            CON="${{ steps.scraper.outputs.con_datos }}"
+            git commit -m "📊 Miembros $FECHA | Total: $TOTAL | Grupos: $CON/86"
+            git push
+            echo "✅ Datos actualizados y subidos"
+          fi
+
+      # ── 9. Resumen visual en GitHub Actions ──────────────────
+      - name: 📊 Resumen de ejecución
+        if: always()
+        run: |
+          echo "## 📊 Resultado de la ejecución" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Métrica | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 📅 Fecha | $(date +'%Y-%m-%d %H:%M UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "| 👥 Total miembros | **${{ steps.scraper.outputs.total_miembros }}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ Grupos con datos | ${{ steps.scraper.outputs.con_datos }}/86 |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚠️ Grupos sin datos | ${{ steps.scraper.outputs.sin_datos }}/86 |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔧 Motivo | ${{ github.event.inputs.motivo || 'Scheduled' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Alerta de cookies si hay muchos fallos
+          SIN="${{ steps.scraper.outputs.sin_datos }}"
+          if [ -n "$SIN" ] && [ "$SIN" -gt "50" ] 2>/dev/null; then
+            echo "### ⚠️ Advertencia" >> $GITHUB_STEP_SUMMARY
+            echo "Más de 50 grupos no devolvieron datos." >> $GITHUB_STEP_SUMMARY
+            echo "**Acción recomendada:** Renovar \`FB_COOKIES\` en los secrets del repositorio." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ── 10. Notificación de fallo ─────────────────────────────
+      - name: ❌ Notificar fallo total
         if: failure()
         run: |
-          echo "::error::El scraper falló. Revisa los logs para más detalles."
-          echo "Posibles causas:"
-          echo "  1. APIFY_TOKEN expirado o incorrecto"
-          echo "  2. FB_COOKIES expiradas (renovar cada 30 días)"
-          echo "  3. Actor de Apify cambió su API"
+          echo "::error title=Scraper falló::No se pudieron obtener datos de ningún grupo"
+          echo ""
+          echo "📋 Posibles causas y soluciones:"
+          echo "  1. FB_COOKIES expiradas → Renovar en Settings > Secrets > FB_COOKIES"
+          echo "     Las cookies de Facebook duran ~90 días"
+          echo "  2. Facebook bloqueó las requests → Esperar 24h o cambiar User-Agent"
+          echo "  3. Error en el script → Revisar artifacts/scraper-log para detalles"
+          echo ""
+          echo "🔍 Para diagnosticar: ejecutar manualmente con debug=true"
