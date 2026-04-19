@@ -2,7 +2,7 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 
-const FB_COOKIES = process.env.FB_COOKIES;
+const APIFY_TOKEN = process.env.APIFY_TOKEN;
 
 const GRUPOS = [
   { name: "Cubanos en Florida-1",                    url: "https://www.facebook.com/groups/cubanosenflorida1/" },
@@ -13,7 +13,7 @@ const GRUPOS = [
   { name: "REVOLICO CIEGO DE AVILA",                  url: "https://www.facebook.com/groups/5111591572270244/" },
   { name: "Reservas de Vuelos Cuba - Panamá",         url: "https://www.facebook.com/groups/2938946762934546/" },
   { name: "Revolico En la Habana",                    url: "https://www.facebook.com/groups/revolicoenlahabanacu/" },
-  { name: "Cubanos en CDMX-1",                        url: "https://www.facebook.com/groups/cubanosencdmx1/" },
+  { name: "Cubanos en CDMX-1",                       url: "https://www.facebook.com/groups/cubanosencdmx1/" },
   { name: "Reservas de Vuelos Cuba - Nicaragua",      url: "https://www.facebook.com/groups/ventasvueloscubanicaragua1/" },
   { name: "Cubanos en West Palm-1",                   url: "https://www.facebook.com/groups/cubanosenwestpalm/" },
   { name: "COMPRA VENTA EN HOLGUÍN",                  url: "https://www.facebook.com/groups/compradedivisasholguin/" },
@@ -93,346 +93,244 @@ const GRUPOS = [
   { name: "Cubanos en Montreal Canadá-1",             url: "https://www.facebook.com/groups/1985567971886403/" },
 ];
 
-// ── Cookie helper ──────────────────────────────────────────────
-function buildCookieHeader(cookiesJson) {
-  try {
-    const parsed = JSON.parse(cookiesJson);
-    // Acepta tanto array de objetos {name,value} como objeto plano {name:value}
-    if (Array.isArray(parsed)) {
-      return parsed.map((c) => `${c.name}=${c.value}`).join("; ");
-    }
-    return Object.entries(parsed).map(([k, v]) => `${k}=${v}`).join("; ");
-  } catch {
-    // Si ya es una cadena cookie cruda, devolverla directamente
-    if (typeof cookiesJson === "string" && cookiesJson.includes("=")) return cookiesJson;
-    return "";
-  }
-}
-
-// ── Extrae el ID numérico del grupo desde la URL ───────────────
-function extractGroupId(url) {
-  const m = url.match(/groups\/(\d+)/);
-  return m ? m[1] : null;
-}
-
-// ── Construye las URLs a intentar para cada grupo ─────────────
-// Orden de preferencia:
-// 1. m.facebook.com/groups/<ID>  (versión móvil ligera, mismas cookies de www)
-// 2. mbasic.facebook.com/groups/<ID>
-// 3. www.facebook.com/groups/<slug>/members (a veces muestra conteo en SSR)
-function buildUrls(grupo) {
-  const urls = [];
-  const groupId = extractGroupId(grupo.url);
-
-  // Slug o ID según la URL original
-  const pathMatch = grupo.url.match(/\/groups\/([^/?#]+)/);
-  const slug = pathMatch ? pathMatch[1] : null;
-
-  if (groupId) {
-    urls.push(`https://m.facebook.com/groups/${groupId}/`);
-  }
-  if (slug) {
-    urls.push(`https://m.facebook.com/groups/${slug}/`);
-    urls.push(`https://mbasic.facebook.com/groups/${slug}/`);
-  }
-  if (groupId && slug !== groupId) {
-    urls.push(`https://mbasic.facebook.com/groups/${groupId}/`);
-  }
-
-  // Deduplicar
-  return [...new Set(urls)];
-}
-
-// ── Fetch HTML con seguimiento de redirecciones ────────────────
-function fetchPage(fullUrl, cookieHeader, redirectCount = 0) {
-  return new Promise((resolve) => {
-    if (redirectCount > 5) {
-      resolve({ html: "", error: "too_many_redirects", status: 0, finalUrl: fullUrl });
-      return;
-    }
-
-    let urlObj;
-    try { urlObj = new URL(fullUrl); } catch {
-      resolve({ html: "", error: "invalid_url", status: 0, finalUrl: fullUrl });
-      return;
-    }
-
-    const isMobile = urlObj.hostname.startsWith("m.");
-
+// ── Apify HTTP helper ──────────────────────────────────────────
+function apifyRequest(method, urlPath, body = null) {
+  return new Promise((resolve, reject) => {
     const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: "GET",
-      headers: {
-        // m.facebook.com requiere User-Agent de teléfono iOS/Android
-        "User-Agent": isMobile
-          ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-          : "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "identity",
-        "Cookie": cookieHeader,
-        "Referer": isMobile ? "https://m.facebook.com/" : "https://mbasic.facebook.com/",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-      },
+      hostname: "api.apify.com",
+      path: urlPath,
+      method,
+      headers: { "Content-Type": "application/json" },
     };
-
     const req = https.request(options, (res) => {
-      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-        const location = res.headers.location || "";
-        if (location.includes("login") || location.includes("checkpoint") || location.includes("recover")) {
-          resolve({ html: "", error: "redirect_login", status: res.statusCode, finalUrl: fullUrl });
-          return;
-        }
-        const nextUrl = location.startsWith("http")
-          ? location
-          : `https://${urlObj.hostname}${location}`;
-        fetchPage(nextUrl, cookieHeader, redirectCount + 1).then(resolve);
-        return;
-      }
-
       const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("data", c => chunks.push(c));
       res.on("end", () => {
-        const html = Buffer.concat(chunks).toString("utf8");
-        resolve({ html, status: res.statusCode, error: null, finalUrl: fullUrl });
+        try { resolve({ status: res.statusCode, data: JSON.parse(Buffer.concat(chunks).toString()) }); }
+        catch { resolve({ status: res.statusCode, data: null }); }
       });
     });
-
-    req.on("error", (err) => resolve({ html: "", error: err.message, status: 0, finalUrl: fullUrl }));
-    req.setTimeout(30000, () => { req.destroy(); resolve({ html: "", error: "timeout", status: 0, finalUrl: fullUrl }); });
+    req.on("error", reject);
+    req.setTimeout(30000, () => { req.destroy(); reject(new Error("timeout")); });
+    if (body) req.write(JSON.stringify(body));
     req.end();
   });
 }
 
-// ── Extraer conteo de miembros ─────────────────────────────────
-// Cubre los formatos de m.facebook.com, mbasic.facebook.com y www
-function extractMemberCount(html) {
-  if (!html || html.length < 200) return null;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  const candidates = [];
-
-  // ── 1. JSON embebido (máxima prioridad, más preciso) ──────────
-  // Facebook incluye el conteo exacto en múltiples claves JSON
-  const jsonPatterns = [
-    /"member_count"\s*:\s*(\d+)/g,
-    /"members_count"\s*:\s*(\d+)/g,
-    /"memberCount"\s*:\s*(\d+)/g,
-    /"membersCount"\s*:\s*(\d+)/g,
-    /"total_count"\s*:\s*(\d+)/g,
-    // m.facebook.com a veces usa esta forma
-    /"count"\s*:\s*(\d+).*?"members"/g,
-    // Datos serializados en __bbox / __elem
-    /members.*?"count"\s*:\s*(\d+)/g,
-  ];
-
-  for (const re of jsonPatterns) {
-    for (const m of [...html.matchAll(re)]) {
-      const n = parseInt(m[1], 10);
-      if (n >= 10 && n <= 50_000_000) candidates.push(n);
-    }
+// ── Lanzar actor ───────────────────────────────────────────────
+async function startRun(actorId, input) {
+  const { status, data } = await apifyRequest(
+    "POST",
+    `/v2/acts/${actorId}/runs?token=${APIFY_TOKEN}`,
+    input
+  );
+  if (status !== 201 || !data?.data?.id) {
+    throw new Error(`HTTP ${status}: ${JSON.stringify(data?.error || data)}`);
   }
-
-  // ── 2. member_count_text (p.ej. "66K members", "66 mil miembros") ──
-  for (const m of [...html.matchAll(/"member_count_text"\s*:\s*"([^"]{1,40})"/g)]) {
-    const text = m[1].replace(/\\u[\dA-Fa-f]{4}/g, (esc) =>
-      String.fromCharCode(parseInt(esc.slice(2), 16))
-    );
-    const val = parseAbbreviated(text);
-    if (val) candidates.push(val);
-  }
-
-  // ── 3. Texto visible en HTML (m.facebook.com y mbasic) ───────
-  // m.facebook muestra el número en aria-label, data-*, o texto plano
-  const visiblePatterns = [
-    // "66,975 members" / "66 975 miembros" / "66.975 miembros"
-    /\b(\d{1,3}(?:[,.\s]\d{3})+)\s*(?:members?|miembros?|membres?|участников|участника)\b/gi,
-    // Grupos pequeños sin separador de miles
-    /\b(\d{3,7})\s*(?:members?|miembros?|membres?|участников)\b/gi,
-    // Bullet separado: "· 66,975 members"
-    /[·•\|]\s*([\d][\d\s,._]+)\s*(?:members?|miembros?)\b/gi,
-    /(?:members?|miembros?)\s*[·•:]\s*([\d][\d\s,._]+)/gi,
-    // aria-label="66,975 members"
-    /aria-label="([\d,.\s]+)\s*(?:members?|miembros?)"/gi,
-    // data-testid o similares con números
-    /Members[^"]{0,30}?(\d{1,3}(?:[,\s]\d{3})+)/gi,
-    // Formato español: "66.975" (punto como sep de miles)
-    /\b(\d{1,3}(?:\.\d{3})+)\s*(?:miembros?|members?)\b/gi,
-  ];
-
-  for (const re of visiblePatterns) {
-    for (const m of [...html.matchAll(re)]) {
-      const raw = (m[1] || m[2] || "").replace(/[\s,._]/g, "");
-      const val = parseInt(raw, 10);
-      if (!isNaN(val) && val >= 10 && val <= 50_000_000) candidates.push(val);
-    }
-  }
-
-  // ── 4. Formato abreviado en texto visible ("66K", "66 mil") ──
-  for (const m of [...html.matchAll(/\b([\d]+[.,]?[\d]*)\s*(K|mil|k|thousand|тыс)\b/gi)]) {
-    const val = parseAbbreviated(`${m[1]} ${m[2]}`);
-    if (val && val >= 1000 && val <= 50_000_000) candidates.push(val);
-  }
-
-  if (candidates.length === 0) return null;
-
-  // Devolver el valor máximo (descarta ruido de números pequeños)
-  return Math.max(...candidates);
+  return data.data.id;
 }
 
-// ── Parsea texto abreviado: "66K", "66,5K", "66 mil", "1.2M" ─
-function parseAbbreviated(text) {
-  if (!text) return null;
-  const clean = text.trim().toLowerCase();
-  const numMatch = clean.match(/([\d]+[.,][\d]+|[\d]+)/);
-  if (!numMatch) return null;
-  const base = parseFloat(numMatch[1].replace(",", "."));
-
-  if (clean.includes("m") && !clean.includes("mil")) return Math.round(base * 1_000_000);
-  if (clean.includes("mil") || clean.includes("k") || clean.includes("thousand") || clean.includes("тыс")) {
-    return Math.round(base * 1000);
+// ── Esperar resultado ──────────────────────────────────────────
+async function waitForRun(runId, timeoutMs = 30 * 60 * 1000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await sleep(15000);
+    const { status, data } = await apifyRequest("GET", `/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`);
+    if (status !== 200) throw new Error(`HTTP ${status} consultando run`);
+    const s = data?.data?.status;
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    process.stdout.write(`\r⏳ ${elapsed}s | estado: ${s}          `);
+    if (["SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"].includes(s)) {
+      console.log();
+      return data.data;
+    }
   }
-  if (base >= 100) return Math.round(base); // número sin sufijo
+  throw new Error("Timeout esperando Apify");
+}
+
+// ── Obtener items del dataset ──────────────────────────────────
+async function getItems(datasetId) {
+  const { status, data } = await apifyRequest(
+    "GET",
+    `/v2/datasets/${datasetId}/items?token=${APIFY_TOKEN}&limit=500&clean=true`
+  );
+  if (status !== 200) throw new Error(`HTTP ${status} obteniendo dataset`);
+  return Array.isArray(data) ? data : (data?.items || []);
+}
+
+// ── Extraer memberCount de un item (estructura flexible) ───────
+function extractCount(item) {
+  // Recorrer recursivamente el objeto buscando claves de conteo
+  const keys = ["memberCount", "member_count", "membersCount", "members_count",
+                 "totalMembers", "total_members", "members", "groupMembers"];
+  for (const k of keys) {
+    if (typeof item[k] === "number" && item[k] > 0) return item[k];
+    if (typeof item[k] === "string" && /^\d+$/.test(item[k])) return parseInt(item[k]);
+  }
+  // Buscar en subobjetos comunes
+  for (const sub of ["info", "groupInfo", "about", "details", "group"]) {
+    if (item[sub] && typeof item[sub] === "object") {
+      const v = extractCount(item[sub]);
+      if (v) return v;
+    }
+  }
   return null;
 }
 
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+// ── Mapear items Apify → grupos ────────────────────────────────
+function mapResults(items, grupos) {
+  // Índice por URL normalizada e ID
+  const byUrl = new Map();
+  const byId  = new Map();
 
-// ── Intenta varias URLs hasta obtener datos ───────────────────
-async function fetchGroupMembers(grupo, cookieHeader) {
-  const urls = buildUrls(grupo);
+  for (const item of items) {
+    const count = extractCount(item);
+    if (!count) continue;
 
-  for (const url of urls) {
-    const { html, error, status } = await fetchPage(url, cookieHeader);
+    const rawUrl = item.url || item.pageUrl || item.groupUrl || item.inputUrl || "";
+    const normUrl = rawUrl.replace(/\/$/, "").toLowerCase();
+    if (normUrl) byUrl.set(normUrl, count);
 
-    if (error === "redirect_login") {
-      return { miembros: null, estado: "cookies_expiradas", url };
+    const id = String(item.id || item.groupId || item.group_id || "");
+    if (id) byId.set(id, count);
+
+    // A veces la URL de input viene en item.input
+    if (item.input?.url) {
+      const u = item.input.url.replace(/\/$/, "").toLowerCase();
+      byUrl.set(u, count);
     }
-    if (error) continue; // intentar siguiente URL
+  }
 
-    const miembros = extractMemberCount(html);
-    if (miembros !== null) {
-      return { miembros, estado: "ok", url };
+  console.log(`\n📦 Items Apify: ${items.length} | Con memberCount: ${byUrl.size + byId.size}`);
+
+  return grupos.map(g => {
+    const normUrl = g.url.replace(/\/$/, "").toLowerCase();
+    let count = byUrl.get(normUrl);
+
+    if (!count) {
+      const idM = g.url.match(/groups\/(\d+)/);
+      if (idM) count = byId.get(idM[1]);
     }
 
-    // Debug: guardar HTML si es muy corto (posible página de error)
-    if (html.length < 3000) {
-      return { miembros: null, estado: `sin_datos_short_${html.length}`, url, html };
+    if (!count) {
+      // Búsqueda parcial por slug
+      const slugM = g.url.match(/groups\/([^/?#]+)/);
+      if (slugM) {
+        for (const [k, v] of byUrl.entries()) {
+          if (k.includes(slugM[1].toLowerCase())) { count = v; break; }
+        }
+      }
     }
-  }
 
-  return { miembros: null, estado: "sin_datos", url: urls[0] || grupo.url };
-}
-
-// ── Debug mejorado ─────────────────────────────────────────────
-function debugGroup(html, groupName, url) {
-  console.log(`\n   🔍 DEBUG: ${groupName} → ${url}`);
-  console.log(`   HTML length: ${html.length} chars`);
-
-  // Buscar fragmentos con números grandes
-  const numberSnippets = [];
-  for (const m of [...html.matchAll(/\b\d{3,}[\d,.\s]*\b/g)]) {
-    const n = parseInt(m[0].replace(/[^0-9]/g, ""), 10);
-    if (n >= 1000 && n <= 50_000_000) {
-      const start = Math.max(0, m.index - 40);
-      const end = Math.min(html.length, m.index + 60);
-      numberSnippets.push(html.slice(start, end).replace(/\s+/g, " ").trim());
-    }
-    if (numberSnippets.length >= 3) break;
-  }
-
-  if (numberSnippets.length) {
-    console.log(`   Números grandes encontrados:`);
-    numberSnippets.forEach((s) => console.log(`     …${s}…`));
-  }
-
-  // Buscar contexto de member/miembro
-  const memberCtx = html.match(/.{0,60}(?:member|miembro|membre).{0,60}/gi);
-  if (memberCtx) {
-    console.log(`   Contexto "member": ${memberCtx.slice(0, 2).join(" | ").replace(/\s+/g, " ")}`);
-  } else {
-    console.log(`   No se encontró "member/miembro" en el HTML`);
-  }
-
-  if ((html.includes("login") || html.includes("checkpoint")) && html.length < 8000) {
-    console.log(`   ⚠️  Posible página de login o checkpoint`);
-  }
+    return { nombre: g.name, url: g.url, miembros: count || null, estado: count ? "ok" : "sin_datos" };
+  });
 }
 
 // ── Main ───────────────────────────────────────────────────────
 async function main() {
-  if (!FB_COOKIES) {
-    console.error("❌ Falta FB_COOKIES en los secrets");
-    process.exit(1);
-  }
+  if (!APIFY_TOKEN) { console.error("❌ Falta APIFY_TOKEN"); process.exit(1); }
 
-  const cookieHeader = buildCookieHeader(FB_COOKIES);
-  if (!cookieHeader) {
-    console.error("❌ No se pudieron parsear las cookies (formato inválido)");
-    process.exit(1);
-  }
-
-  // Verificar que las cookies contienen tokens esenciales
-  const hasDatr = cookieHeader.includes("datr=");
-  const hasC_user = cookieHeader.includes("c_user=");
-  const hasXs = cookieHeader.includes("xs=");
-  console.log(`🍪 Cookies cargadas | datr:${hasDatr ? "✅" : "❌"} | c_user:${hasC_user ? "✅" : "❌"} | xs:${hasXs ? "✅" : "❌"}`);
-
-  if (!hasC_user || !hasXs) {
-    console.warn("⚠️  Las cookies pueden estar incompletas. Se necesitan al menos: c_user, xs, datr");
-  }
-
-  console.log(`📋 Grupos a procesar: ${GRUPOS.length}`);
-  console.log(`🌐 Usando m.facebook.com → mbasic.facebook.com (fallback)\n`);
+  console.log(`📋 Grupos: ${GRUPOS.length} | Token: ${APIFY_TOKEN.slice(0,8)}...`);
 
   const today = new Date().toISOString().split("T")[0];
-  const results = [];
-  let debugCount = 0;
+  const groupUrls = GRUPOS.map(g => g.url);
 
-  for (let i = 0; i < GRUPOS.length; i++) {
-    const grupo = GRUPOS[i];
-    process.stdout.write(`[${String(i + 1).padStart(2, "0")}/${GRUPOS.length}] ${grupo.name}... `);
+  // ── Configuraciones de actores a intentar (en orden) ────────
+  // Apify tiene varios actores para Facebook Groups; probamos el más
+  // confiable primero y caemos al siguiente si falla.
+  const ACTOR_CONFIGS = [
+    {
+      id: "apify~facebook-groups-scraper",
+      label: "facebook-groups-scraper (oficial)",
+      input: {
+        startUrls: groupUrls.map(url => ({ url })),
+        maxPosts: 0,
+        maxPostComments: 0,
+        scrapeAbout: true,
+        scrapePosts: false,
+      },
+    },
+    {
+      id: "zuzka~facebook-group-scraper",
+      label: "facebook-group-scraper (zuzka)",
+      input: {
+        groupUrls: groupUrls,
+        maxItems: 1,
+      },
+    },
+    {
+      id: "curious_coder~facebook-groups-scraper",
+      label: "facebook-groups-scraper (curious_coder)",
+      input: {
+        startUrls: groupUrls.map(url => ({ url })),
+        maxPosts: 0,
+      },
+    },
+  ];
 
-    const { miembros, estado, url, html } = await fetchGroupMembers(grupo, cookieHeader);
+  let runData = null;
+  let usedActor = null;
 
-    if (estado === "cookies_expiradas") {
-      console.log("⚠️  cookies expiradas/inválidas");
-      results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros: null, estado });
-    } else if (miembros !== null) {
-      console.log(`✅ ${miembros.toLocaleString()} miembros`);
-      results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros, estado: "ok" });
-    } else {
-      console.log(`⚠️  N/A (${estado})`);
-      if (debugCount < 5 && html) {
-        debugGroup(html, grupo.name, url);
-        debugCount++;
+  for (const cfg of ACTOR_CONFIGS) {
+    try {
+      console.log(`\n🚀 Intentando: ${cfg.label}`);
+      const runId = await startRun(cfg.id, cfg.input);
+      console.log(`   Run ID: ${runId}`);
+      const result = await waitForRun(runId);
+
+      if (result.status === "SUCCEEDED" && result.defaultDatasetId) {
+        runData = result;
+        usedActor = cfg.label;
+        break;
+      } else {
+        console.warn(`   ⚠️  Terminó con estado: ${result.status}`);
       }
-      results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros: null, estado });
-    }
-
-    if (i < GRUPOS.length - 1) {
-      // Pausa variable 2–4 segundos para evitar rate limiting
-      const pausa = 2000 + Math.floor(Math.random() * 2000);
-      await sleep(pausa);
+    } catch (err) {
+      console.warn(`   ⚠️  Error: ${err.message}`);
     }
   }
 
-  // ── Resumen ────────────────────────────────────────────────
-  const totalMiembros = results.reduce((s, r) => s + (r.miembros || 0), 0);
-  const conDatos      = results.filter((r) => r.estado === "ok").length;
-  const sinDatos      = results.filter((r) => r.estado !== "ok").length;
+  if (!runData) {
+    console.error("\n❌ Todos los actores de Apify fallaron.");
+    console.error("Verifica que APIFY_TOKEN tiene saldo y acceso a actores de Facebook.");
+    process.exit(1);
+  }
 
-  console.log("\n════════════════════════════════════════════");
-  console.log(`📅 Fecha         : ${today}`);
+  console.log(`\n✅ Actor exitoso: ${usedActor}`);
+  console.log(`📥 Obteniendo dataset: ${runData.defaultDatasetId}`);
+
+  const items = await getItems(runData.defaultDatasetId);
+  console.log(`📦 Items recibidos: ${items.length}`);
+
+  // Debug: estructura del primer item
+  if (items.length > 0) {
+    console.log(`\n🔍 Claves del primer item: ${Object.keys(items[0]).join(", ")}`);
+    const sample = {};
+    for (const k of Object.keys(items[0]).slice(0, 15)) sample[k] = items[0][k];
+    console.log(JSON.stringify(sample, null, 2).slice(0, 800));
+  }
+
+  const mapped = mapResults(items, GRUPOS);
+  const results = mapped.map(r => ({ fecha: today, ...r }));
+
+  const totalMiembros = results.reduce((s, r) => s + (r.miembros || 0), 0);
+  const conDatos  = results.filter(r => r.estado === "ok").length;
+  const sinDatos  = results.filter(r => r.estado !== "ok").length;
+
+  // Tabla de resultados
+  console.log("\n" + "═".repeat(55));
+  for (const r of results) {
+    const tag = r.miembros ? `✅ ${r.miembros.toLocaleString()}` : "⚠️  N/A";
+    console.log(`${r.nombre.slice(0,38).padEnd(40)} ${tag}`);
+  }
+  console.log("═".repeat(55));
+  console.log(`📅 Fecha:          ${today}`);
   console.log(`👥 TOTAL MIEMBROS: ${totalMiembros.toLocaleString()}`);
-  console.log(`✅ Con datos     : ${conDatos}/${GRUPOS.length}`);
-  console.log(`⚠️  Sin datos     : ${sinDatos}/${GRUPOS.length}`);
-  console.log("════════════════════════════════════════════");
+  console.log(`✅ Con datos:      ${conDatos}/${GRUPOS.length}`);
+  console.log(`⚠️  Sin datos:      ${sinDatos}/${GRUPOS.length}`);
+  console.log("═".repeat(55));
 
   // ── Guardar archivos ───────────────────────────────────────
   const dataDir = path.join(process.cwd(), "data");
@@ -441,49 +339,45 @@ async function main() {
   const historyFile = path.join(dataDir, "history.json");
   let history = [];
   if (fs.existsSync(historyFile)) {
-    try { history = JSON.parse(fs.readFileSync(historyFile, "utf8")); } catch { }
+    try { history = JSON.parse(fs.readFileSync(historyFile, "utf8")); } catch {}
   }
   history.push({ fecha: today, total: totalMiembros, conDatos, grupos: results });
   fs.writeFileSync(historyFile, JSON.stringify(history, null, 2));
 
-  const csv =
-    "fecha,nombre,url,miembros,estado\n" +
-    results.map((r) => `${r.fecha},"${r.nombre}","${r.url}",${r.miembros ?? ""},${r.estado}`).join("\n");
+  const csv = "fecha,nombre,url,miembros,estado\n" +
+    results.map(r => `${r.fecha},"${r.nombre}","${r.url}",${r.miembros ?? ""},${r.estado}`).join("\n");
   fs.writeFileSync(path.join(dataDir, `miembros_${today}.csv`), csv);
 
-  fs.writeFileSync(
-    path.join(dataDir, "latest.json"),
-    JSON.stringify({ fecha: today, total: totalMiembros, conDatos, sinDatos, grupos: results }, null, 2)
-  );
+  fs.writeFileSync(path.join(dataDir, "latest.json"),
+    JSON.stringify({ fecha: today, total: totalMiembros, conDatos, sinDatos, grupos: results }, null, 2));
 
-  console.log(`\n💾 Guardado: data/history.json | data/latest.json | data/miembros_${today}.csv`);
+  // Raw Apify para debug
+  fs.writeFileSync(path.join(dataDir, `apify_raw_${today}.json`), JSON.stringify(items, null, 2));
 
-  // ── GitHub Actions Step Summary ────────────────────────────
+  console.log(`\n💾 data/history.json | data/latest.json | data/miembros_${today}.csv`);
+
+  // GitHub Actions Summary
   if (process.env.GITHUB_STEP_SUMMARY) {
-    const rows = results
-      .map((r) => `| ${r.nombre} | ${r.miembros?.toLocaleString() ?? "N/A"} | ${r.estado === "ok" ? "✅" : "⚠️"} |`)
-      .join("\n");
-
-    const summary =
+    const rows = results.map(r =>
+      `| ${r.nombre} | ${r.miembros?.toLocaleString() ?? "N/A"} | ${r.estado === "ok" ? "✅" : "⚠️"} |`
+    ).join("\n");
+    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
       `## 📊 Miembros de Grupos - ${today}\n` +
       `| | |\n|---|---|\n` +
       `| 👥 **Total** | **${totalMiembros.toLocaleString()}** |\n` +
       `| ✅ Con datos | ${conDatos}/${GRUPOS.length} |\n` +
-      `| ⚠️ Sin datos | ${sinDatos}/${GRUPOS.length} |\n\n` +
-      `<details><summary>Ver detalle por grupo</summary>\n\n` +
-      `| Grupo | Miembros | Estado |\n|---|---|---|\n${rows}\n` +
-      `</details>\n`;
-
-    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+      `| ⚠️ Sin datos | ${sinDatos}/${GRUPOS.length} |\n` +
+      `| 🤖 Actor | ${usedActor} |\n\n` +
+      `<details><summary>Ver detalle</summary>\n\n` +
+      `| Grupo | Miembros | Estado |\n|---|---|---|\n${rows}\n</details>\n`
+    );
   }
 
   console.log("\n✅ Completado");
-
-  // Salir con código de error si ningún grupo tuvo datos
   if (conDatos === 0) {
-    console.error("\n❌ FALLO TOTAL: Ningún grupo devolvió datos. Las cookies pueden estar expiradas.");
+    console.error("❌ Ningún grupo con datos. Revisa APIFY_TOKEN y saldo.");
     process.exit(1);
   }
 }
 
-main().catch((err) => { console.error("💥", err); process.exit(1); });
+main().catch(err => { console.error("💥", err); process.exit(1); });
