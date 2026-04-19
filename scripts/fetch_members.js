@@ -96,218 +96,328 @@ const GRUPOS = [
 // ── Cookie helper ──────────────────────────────────────────────
 function buildCookieHeader(cookiesJson) {
   try {
-    const cookies = JSON.parse(cookiesJson);
-    return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    const parsed = JSON.parse(cookiesJson);
+    // Acepta tanto array de objetos {name,value} como objeto plano {name:value}
+    if (Array.isArray(parsed)) {
+      return parsed.map((c) => `${c.name}=${c.value}`).join("; ");
+    }
+    return Object.entries(parsed).map(([k, v]) => `${k}=${v}`).join("; ");
   } catch {
+    // Si ya es una cadena cookie cruda, devolverla directamente
+    if (typeof cookiesJson === "string" && cookiesJson.includes("=")) return cookiesJson;
     return "";
   }
 }
 
-// ── Versión móvil de Facebook (mbasic) ────────────────────────
-// mbasic.facebook.com sirve HTML puro sin JavaScript, idéntico para
-// grupos grandes y pequeños. Es la forma más fiable de obtener datos
-// estáticos como el conteo de miembros.
-function buildMbasicUrl(groupUrl) {
-  // https://www.facebook.com/groups/XXX/ → https://mbasic.facebook.com/groups/XXX/
-  return groupUrl.replace("https://www.facebook.com/", "https://mbasic.facebook.com/");
+// ── Extrae el ID numérico del grupo desde la URL ───────────────
+function extractGroupId(url) {
+  const m = url.match(/groups\/(\d+)/);
+  return m ? m[1] : null;
 }
 
-// ── Fetch HTML ─────────────────────────────────────────────────
-function fetchPage(fullUrl, cookieHeader) {
+// ── Construye las URLs a intentar para cada grupo ─────────────
+// Orden de preferencia:
+// 1. m.facebook.com/groups/<ID>  (versión móvil ligera, mismas cookies de www)
+// 2. mbasic.facebook.com/groups/<ID>
+// 3. www.facebook.com/groups/<slug>/members (a veces muestra conteo en SSR)
+function buildUrls(grupo) {
+  const urls = [];
+  const groupId = extractGroupId(grupo.url);
+
+  // Slug o ID según la URL original
+  const pathMatch = grupo.url.match(/\/groups\/([^/?#]+)/);
+  const slug = pathMatch ? pathMatch[1] : null;
+
+  if (groupId) {
+    urls.push(`https://m.facebook.com/groups/${groupId}/`);
+  }
+  if (slug) {
+    urls.push(`https://m.facebook.com/groups/${slug}/`);
+    urls.push(`https://mbasic.facebook.com/groups/${slug}/`);
+  }
+  if (groupId && slug !== groupId) {
+    urls.push(`https://mbasic.facebook.com/groups/${groupId}/`);
+  }
+
+  // Deduplicar
+  return [...new Set(urls)];
+}
+
+// ── Fetch HTML con seguimiento de redirecciones ────────────────
+function fetchPage(fullUrl, cookieHeader, redirectCount = 0) {
   return new Promise((resolve) => {
-    const urlObj = new URL(fullUrl);
+    if (redirectCount > 5) {
+      resolve({ html: "", error: "too_many_redirects", status: 0, finalUrl: fullUrl });
+      return;
+    }
+
+    let urlObj;
+    try { urlObj = new URL(fullUrl); } catch {
+      resolve({ html: "", error: "invalid_url", status: 0, finalUrl: fullUrl });
+      return;
+    }
+
+    const isMobile = urlObj.hostname.startsWith("m.");
 
     const options = {
       hostname: urlObj.hostname,
       path: urlObj.pathname + urlObj.search,
       method: "GET",
       headers: {
-        // User-Agent de móvil Android — coherente con mbasic.facebook.com
-        "User-Agent": "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
+        // m.facebook.com requiere User-Agent de teléfono iOS/Android
+        "User-Agent": isMobile
+          ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+          : "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept-Encoding": "identity",
         "Cookie": cookieHeader,
-        "Referer": "https://mbasic.facebook.com/",
+        "Referer": isMobile ? "https://m.facebook.com/" : "https://mbasic.facebook.com/",
         "Upgrade-Insecure-Requests": "1",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
       },
     };
 
     const req = https.request(options, (res) => {
-      // Seguir redirecciones manualmente (hasta 3 saltos)
-      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303) {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
         const location = res.headers.location || "";
-        if (location.includes("login") || location.includes("checkpoint")) {
-          resolve({ html: "", error: "redirect_login", status: res.statusCode });
+        if (location.includes("login") || location.includes("checkpoint") || location.includes("recover")) {
+          resolve({ html: "", error: "redirect_login", status: res.statusCode, finalUrl: fullUrl });
           return;
         }
-        // Redirigir a la nueva URL
-        const nextUrl = location.startsWith("http") ? location : `https://${urlObj.hostname}${location}`;
-        fetchPage(nextUrl, cookieHeader).then(resolve);
+        const nextUrl = location.startsWith("http")
+          ? location
+          : `https://${urlObj.hostname}${location}`;
+        fetchPage(nextUrl, cookieHeader, redirectCount + 1).then(resolve);
         return;
       }
 
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => resolve({ html: data, status: res.statusCode, error: null }));
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const html = Buffer.concat(chunks).toString("utf8");
+        resolve({ html, status: res.statusCode, error: null, finalUrl: fullUrl });
+      });
     });
 
-    req.on("error", (err) => resolve({ html: "", error: err.message, status: 0 }));
-    req.setTimeout(25000, () => { req.destroy(); resolve({ html: "", error: "timeout", status: 0 }); });
+    req.on("error", (err) => resolve({ html: "", error: err.message, status: 0, finalUrl: fullUrl }));
+    req.setTimeout(30000, () => { req.destroy(); resolve({ html: "", error: "timeout", status: 0, finalUrl: fullUrl }); });
     req.end();
   });
 }
 
-// ── Extraer conteo de miembros del HTML de mbasic ─────────────
-// mbasic.facebook.com incluye el número exacto en texto plano,
-// sin JavaScript ni ofuscación. Formatos observados:
-//
-//   "· 66,975 members"           (inglés)
-//   "· 66 975 membres"           (francés)
-//   "· 66.975 miembros"          (español, punto como sep. de miles)
-//   "· 66,975 miembros"          (español, coma como sep. de miles)
-//   "Members\n66,975"
-//   JSON embebido: "member_count":66975
-//
+// ── Extraer conteo de miembros ─────────────────────────────────
+// Cubre los formatos de m.facebook.com, mbasic.facebook.com y www
 function extractMemberCount(html) {
-  if (!html || html.length < 500) return null;
+  if (!html || html.length < 200) return null;
 
   const candidates = [];
 
-  // ── 1. Patrones de texto visible en mbasic (más fiables) ──────
-  // mbasic muestra el número exacto sin abreviar en el encabezado del grupo
+  // ── 1. JSON embebido (máxima prioridad, más preciso) ──────────
+  // Facebook incluye el conteo exacto en múltiples claves JSON
+  const jsonPatterns = [
+    /"member_count"\s*:\s*(\d+)/g,
+    /"members_count"\s*:\s*(\d+)/g,
+    /"memberCount"\s*:\s*(\d+)/g,
+    /"membersCount"\s*:\s*(\d+)/g,
+    /"total_count"\s*:\s*(\d+)/g,
+    // m.facebook.com a veces usa esta forma
+    /"count"\s*:\s*(\d+).*?"members"/g,
+    // Datos serializados en __bbox / __elem
+    /members.*?"count"\s*:\s*(\d+)/g,
+  ];
+
+  for (const re of jsonPatterns) {
+    for (const m of [...html.matchAll(re)]) {
+      const n = parseInt(m[1], 10);
+      if (n >= 10 && n <= 50_000_000) candidates.push(n);
+    }
+  }
+
+  // ── 2. member_count_text (p.ej. "66K members", "66 mil miembros") ──
+  for (const m of [...html.matchAll(/"member_count_text"\s*:\s*"([^"]{1,40})"/g)]) {
+    const text = m[1].replace(/\\u[\dA-Fa-f]{4}/g, (esc) =>
+      String.fromCharCode(parseInt(esc.slice(2), 16))
+    );
+    const val = parseAbbreviated(text);
+    if (val) candidates.push(val);
+  }
+
+  // ── 3. Texto visible en HTML (m.facebook.com y mbasic) ───────
+  // m.facebook muestra el número en aria-label, data-*, o texto plano
   const visiblePatterns = [
     // "66,975 members" / "66 975 miembros" / "66.975 miembros"
-    /\b(\d{1,3}(?:[,.\s]\d{3})+)\s*(?:members?|miembros?|membres?)\b/gi,
-    // Sin separador de miles (grupos pequeños): "975 miembros"
-    /\b(\d{3,7})\s*(?:members?|miembros?|membres?)\b/gi,
-    // Formato "Members · 66,975" o "Miembros · 66 975"
+    /\b(\d{1,3}(?:[,.\s]\d{3})+)\s*(?:members?|miembros?|membres?|участников|участника)\b/gi,
+    // Grupos pequeños sin separador de miles
+    /\b(\d{3,7})\s*(?:members?|miembros?|membres?|участников)\b/gi,
+    // Bullet separado: "· 66,975 members"
+    /[·•\|]\s*([\d][\d\s,._]+)\s*(?:members?|miembros?)\b/gi,
     /(?:members?|miembros?)\s*[·•:]\s*([\d][\d\s,._]+)/gi,
-    /[·•]\s*([\d][\d\s,._]+)\s*(?:members?|miembros?)/gi,
+    // aria-label="66,975 members"
+    /aria-label="([\d,.\s]+)\s*(?:members?|miembros?)"/gi,
+    // data-testid o similares con números
+    /Members[^"]{0,30}?(\d{1,3}(?:[,\s]\d{3})+)/gi,
+    // Formato español: "66.975" (punto como sep de miles)
+    /\b(\d{1,3}(?:\.\d{3})+)\s*(?:miembros?|members?)\b/gi,
   ];
 
   for (const re of visiblePatterns) {
     for (const m of [...html.matchAll(re)]) {
-      // El grupo de captura puede ser el 1 o el 2 dependiendo del patrón
-      const raw = m[1] || m[2] || "";
-      const val = parseInt(raw.replace(/[\s,._]/g, ""), 10);
-      if (!isNaN(val) && val >= 1 && val <= 50_000_000) candidates.push(val);
+      const raw = (m[1] || m[2] || "").replace(/[\s,._]/g, "");
+      const val = parseInt(raw, 10);
+      if (!isNaN(val) && val >= 10 && val <= 50_000_000) candidates.push(val);
     }
   }
 
-  // ── 2. JSON embebido: MÁXIMO de todos los "member_count" ──────
-  // Facebook a veces incluye JSON en mbasic también; tomamos el MAX
-  // porque los valores pequeños son ruido interno.
-  for (const m of [...html.matchAll(/"member_count"\s*:\s*(\d+)/g)]) {
-    const n = parseInt(m[1], 10);
-    if (n >= 1 && n <= 50_000_000) candidates.push(n);
-  }
-  for (const m of [...html.matchAll(/"members_count"\s*:\s*(\d+)/g)]) {
-    const n = parseInt(m[1], 10);
-    if (n >= 1 && n <= 50_000_000) candidates.push(n);
-  }
-
-  // ── 3. member_count_text abreviado ────────────────────────────
-  for (const m of [...html.matchAll(/"member_count_text"\s*:\s*"([^"]{1,30})"/g)]) {
-    const text = m[1];
-    const milM = text.match(/([\d]+[.,][\d]+)\s*mil/i);
-    const kM   = text.match(/([\d]+[.,][\d]+)\s*[Kk]/i);
-    const pl   = text.match(/^[\s"']*(\d[\d\s,._]*)[\s"']*$/);
-    if (milM) candidates.push(Math.round(parseFloat(milM[1].replace(",", ".")) * 1000));
-    else if (kM) candidates.push(Math.round(parseFloat(kM[1].replace(",", ".")) * 1000));
-    else if (pl) {
-      const v = parseInt(pl[1].replace(/[\s,._]/g, ""), 10);
-      if (!isNaN(v) && v >= 1) candidates.push(v);
-    }
+  // ── 4. Formato abreviado en texto visible ("66K", "66 mil") ──
+  for (const m of [...html.matchAll(/\b([\d]+[.,]?[\d]*)\s*(K|mil|k|thousand|тыс)\b/gi)]) {
+    const val = parseAbbreviated(`${m[1]} ${m[2]}`);
+    if (val && val >= 1000 && val <= 50_000_000) candidates.push(val);
   }
 
   if (candidates.length === 0) return null;
+
+  // Devolver el valor máximo (descarta ruido de números pequeños)
   return Math.max(...candidates);
+}
+
+// ── Parsea texto abreviado: "66K", "66,5K", "66 mil", "1.2M" ─
+function parseAbbreviated(text) {
+  if (!text) return null;
+  const clean = text.trim().toLowerCase();
+  const numMatch = clean.match(/([\d]+[.,][\d]+|[\d]+)/);
+  if (!numMatch) return null;
+  const base = parseFloat(numMatch[1].replace(",", "."));
+
+  if (clean.includes("m") && !clean.includes("mil")) return Math.round(base * 1_000_000);
+  if (clean.includes("mil") || clean.includes("k") || clean.includes("thousand") || clean.includes("тыс")) {
+    return Math.round(base * 1000);
+  }
+  if (base >= 100) return Math.round(base); // número sin sufijo
+  return null;
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// ── Diagnóstico para grupos sin datos ─────────────────────────
-function debugGroup(html, groupName) {
-  console.log(`\n   🔍 DEBUG: ${groupName}`);
+// ── Intenta varias URLs hasta obtener datos ───────────────────
+async function fetchGroupMembers(grupo, cookieHeader) {
+  const urls = buildUrls(grupo);
+
+  for (const url of urls) {
+    const { html, error, status } = await fetchPage(url, cookieHeader);
+
+    if (error === "redirect_login") {
+      return { miembros: null, estado: "cookies_expiradas", url };
+    }
+    if (error) continue; // intentar siguiente URL
+
+    const miembros = extractMemberCount(html);
+    if (miembros !== null) {
+      return { miembros, estado: "ok", url };
+    }
+
+    // Debug: guardar HTML si es muy corto (posible página de error)
+    if (html.length < 3000) {
+      return { miembros: null, estado: `sin_datos_short_${html.length}`, url, html };
+    }
+  }
+
+  return { miembros: null, estado: "sin_datos", url: urls[0] || grupo.url };
+}
+
+// ── Debug mejorado ─────────────────────────────────────────────
+function debugGroup(html, groupName, url) {
+  console.log(`\n   🔍 DEBUG: ${groupName} → ${url}`);
   console.log(`   HTML length: ${html.length} chars`);
 
-  // Buscar cualquier número de 3+ dígitos cerca de palabras clave
-  const snippets = [];
-  for (const re of [/member/gi, /miembro/gi, /membre/gi]) {
-    const m = html.match(new RegExp(`.{0,60}${re.source}.{0,60}`, "gi"));
-    if (m) snippets.push(...m.slice(0, 3));
+  // Buscar fragmentos con números grandes
+  const numberSnippets = [];
+  for (const m of [...html.matchAll(/\b\d{3,}[\d,.\s]*\b/g)]) {
+    const n = parseInt(m[0].replace(/[^0-9]/g, ""), 10);
+    if (n >= 1000 && n <= 50_000_000) {
+      const start = Math.max(0, m.index - 40);
+      const end = Math.min(html.length, m.index + 60);
+      numberSnippets.push(html.slice(start, end).replace(/\s+/g, " ").trim());
+    }
+    if (numberSnippets.length >= 3) break;
   }
-  if (snippets.length) {
-    console.log(`   Contexto "member/miembro": ${snippets.slice(0, 3).join(" | ").replace(/\s+/g, " ")}`);
+
+  if (numberSnippets.length) {
+    console.log(`   Números grandes encontrados:`);
+    numberSnippets.forEach((s) => console.log(`     …${s}…`));
+  }
+
+  // Buscar contexto de member/miembro
+  const memberCtx = html.match(/.{0,60}(?:member|miembro|membre).{0,60}/gi);
+  if (memberCtx) {
+    console.log(`   Contexto "member": ${memberCtx.slice(0, 2).join(" | ").replace(/\s+/g, " ")}`);
   } else {
     console.log(`   No se encontró "member/miembro" en el HTML`);
   }
 
-  // Verificar si la página es de login
-  if (html.includes("login") && html.length < 5000) {
-    console.log(`   ⚠️  Posible página de login (HTML corto + "login")`);
+  if ((html.includes("login") || html.includes("checkpoint")) && html.length < 8000) {
+    console.log(`   ⚠️  Posible página de login o checkpoint`);
   }
 }
 
 // ── Main ───────────────────────────────────────────────────────
 async function main() {
   if (!FB_COOKIES) {
-    console.error("❌ Falta FB_COOKIES en los secrets de GitHub");
+    console.error("❌ Falta FB_COOKIES en los secrets");
     process.exit(1);
   }
 
   const cookieHeader = buildCookieHeader(FB_COOKIES);
   if (!cookieHeader) {
-    console.error("❌ No se pudieron parsear las cookies");
+    console.error("❌ No se pudieron parsear las cookies (formato inválido)");
     process.exit(1);
   }
 
-  console.log(`🍪 Cookies cargadas correctamente`);
+  // Verificar que las cookies contienen tokens esenciales
+  const hasDatr = cookieHeader.includes("datr=");
+  const hasC_user = cookieHeader.includes("c_user=");
+  const hasXs = cookieHeader.includes("xs=");
+  console.log(`🍪 Cookies cargadas | datr:${hasDatr ? "✅" : "❌"} | c_user:${hasC_user ? "✅" : "❌"} | xs:${hasXs ? "✅" : "❌"}`);
+
+  if (!hasC_user || !hasXs) {
+    console.warn("⚠️  Las cookies pueden estar incompletas. Se necesitan al menos: c_user, xs, datr");
+  }
+
   console.log(`📋 Grupos a procesar: ${GRUPOS.length}`);
-  console.log(`🌐 Usando mbasic.facebook.com (HTML puro, sin JS)\n`);
+  console.log(`🌐 Usando m.facebook.com → mbasic.facebook.com (fallback)\n`);
 
   const today = new Date().toISOString().split("T")[0];
   const results = [];
-  let debugCount = 0; // Mostrar debug solo para los primeros 3 fallos
+  let debugCount = 0;
 
   for (let i = 0; i < GRUPOS.length; i++) {
     const grupo = GRUPOS[i];
     process.stdout.write(`[${String(i + 1).padStart(2, "0")}/${GRUPOS.length}] ${grupo.name}... `);
 
-    const mbasicUrl = buildMbasicUrl(grupo.url);
-    const { html, error, status } = await fetchPage(mbasicUrl, cookieHeader);
+    const { miembros, estado, url, html } = await fetchGroupMembers(grupo, cookieHeader);
 
-    if (error === "redirect_login") {
-      console.log("⚠️  cookies expiradas");
-      results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros: null, estado: "cookies_expiradas" });
-
-    } else if (error) {
-      console.log(`⚠️  error: ${error}`);
-      results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros: null, estado: "error" });
-
+    if (estado === "cookies_expiradas") {
+      console.log("⚠️  cookies expiradas/inválidas");
+      results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros: null, estado });
+    } else if (miembros !== null) {
+      console.log(`✅ ${miembros.toLocaleString()} miembros`);
+      results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros, estado: "ok" });
     } else {
-      const miembros = extractMemberCount(html);
-
-      if (miembros !== null) {
-        console.log(`✅ ${miembros.toLocaleString()} miembros`);
-        results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros, estado: "ok" });
-      } else {
-        console.log(`⚠️  N/A (HTTP ${status})`);
-        if (debugCount < 3) {
-          debugGroup(html, grupo.name);
-          debugCount++;
-        }
-        results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros: null, estado: "sin_datos" });
+      console.log(`⚠️  N/A (${estado})`);
+      if (debugCount < 5 && html) {
+        debugGroup(html, grupo.name, url);
+        debugCount++;
       }
+      results.push({ fecha: today, nombre: grupo.name, url: grupo.url, miembros: null, estado });
     }
 
-    // Pausa variable para evitar detección de bots
-    // Grupos grandes: pausa un poco más larga
     if (i < GRUPOS.length - 1) {
-      const pausa = 1500 + Math.floor(Math.random() * 500);
+      // Pausa variable 2–4 segundos para evitar rate limiting
+      const pausa = 2000 + Math.floor(Math.random() * 2000);
       await sleep(pausa);
     }
   }
@@ -368,6 +478,12 @@ async function main() {
   }
 
   console.log("\n✅ Completado");
+
+  // Salir con código de error si ningún grupo tuvo datos
+  if (conDatos === 0) {
+    console.error("\n❌ FALLO TOTAL: Ningún grupo devolvió datos. Las cookies pueden estar expiradas.");
+    process.exit(1);
+  }
 }
 
 main().catch((err) => { console.error("💥", err); process.exit(1); });
